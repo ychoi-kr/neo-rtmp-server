@@ -23,8 +23,8 @@ struct StreamBroadcaster {
 
 impl StreamBroadcaster {
     fn new() -> Self {
-        let (video_tx, _) = broadcast::channel(100);
-        let (audio_tx, _) = broadcast::channel(100);
+        let (video_tx, _) = broadcast::channel(1024);
+        let (audio_tx, _) = broadcast::channel(1024);
         Self {
             video_tx,
             audio_tx,
@@ -166,52 +166,67 @@ where
 
         // 플레이어 모드인 경우 브로드캐스트 데이터 전송
         if is_player {
-            // 논블로킹으로 데이터 확인 (비디오)
+            // VIDEO: drain until Empty (catch-up)
             if let Some(ref mut rx) = video_rx {
-                match rx.try_recv() {
-                    Ok((data, timestamp)) => {
-                        let packet = session.send_video_data(
-                            player_stream_id,
-                            data,
-                            RtmpTimestamp::new(timestamp),
-                            false,
-                        )?;
-                        if !packet.bytes.is_empty() {
-                            stream.write_all(&packet.bytes).await?;
+                let mut drained = 0usize;
+                loop {
+                    match rx.try_recv() {
+                        Ok((data, timestamp)) => {
+                            // inter-frame(=non-keyframe)은 드롭 허용해도 OK
+                            let is_keyframe = data.len() >= 1 && (data[0] >> 4) == 1; // FLV FrameType 1 = keyframe
+                            let pkt = session.send_video_data(
+                                player_stream_id,
+                                data,
+                                RtmpTimestamp::new(timestamp),
+                                !is_keyframe, // keyframe은 false(=드롭 금지), 그 외 true(=드롭 허용)
+                            )?;
+                            if !pkt.bytes.is_empty() {
+                                stream.write_all(&pkt.bytes).await?;
+                            }
+                            drained += 1;
+                            if drained >= 120 { break; } // 과도한 한 번에 전송 방지(2초분 정도 캡)
                         }
-                    }
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                        warn!("Video frames {} skipped", skipped);
-                    }
-                    Err(broadcast::error::TryRecvError::Closed) => {
-                        info!("Stream Ended");
-                        break;
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            // 너무 시끄러우면 debug로
+                            log::debug!("Video frames {} skipped", skipped);
+                            continue; // 계속 드레인 시도
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            info!("Stream ended");
+                            break;
+                        }
                     }
                 }
             }
 
-            // 논블로킹으로 데이터 확인 (오디오)
+            // AUDIO: drain until Empty (보통 드롭 비권장 → can_be_dropped=false 유지)
             if let Some(ref mut rx) = audio_rx {
-                match rx.try_recv() {
-                    Ok((data, timestamp)) => {
-                        let packet = session.send_audio_data(
-                            player_stream_id,
-                            data,
-                            RtmpTimestamp::new(timestamp),
-                            false,
-                        )?;
-                        if !packet.bytes.is_empty() {
-                            stream.write_all(&packet.bytes).await?;
+                let mut drained = 0usize;
+                loop {
+                    match rx.try_recv() {
+                        Ok((data, timestamp)) => {
+                            let pkt = session.send_audio_data(
+                                player_stream_id,
+                                data,
+                                RtmpTimestamp::new(timestamp),
+                                false, // 오디오는 끊김 티가 커서 드롭 비권장
+                            )?;
+                            if !pkt.bytes.is_empty() {
+                                stream.write_all(&pkt.bytes).await?;
+                            }
+                            drained += 1;
+                            if drained >= 120 { break; }
                         }
-                    }
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                        warn!("Audio frames {} skipped", skipped);
-                    }
-                    Err(broadcast::error::TryRecvError::Closed) => {
-                        info!("Stream Ended");
-                        break;
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            log::debug!("Audio frames {} skipped", skipped);
+                            continue;
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            info!("Stream ended");
+                            break;
+                        }
                     }
                 }
             }
